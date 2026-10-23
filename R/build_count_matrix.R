@@ -5,20 +5,166 @@ is_bam_paired <- function(bam_path) {
   any(bitwAnd(head(flags, 1000), 0x1) != 0)
 }
 
+# TRUE if any of the first 1000 records of ONE BAM carries the "read paired" flag (0x1); NA if the
+# BAM has no records. Reads only those records (yieldSize, no index). Used to check every BAM
+# against the PE/SE decision; the decision itself still comes from is_bam_paired() under "auto".
+.bam_paired_head <- function(bam) {
+  bf <- BamFile(bam, index = character(0), yieldSize = 1000)
+  open(bf)
+  on.exit(close(bf))
+  flags <- scanBam(bf, param = ScanBamParam(what = "flag"))[[1]]$flag
+  if (length(flags) == 0) return(NA)
+  any(bitwAnd(flags, 0x1) != 0)
+}
+
+# ---- SE extension resolver (per-BAM 'ext' helper for build_count_matrix) ----
+# Resolve 'ext' into an integer vector aligned to bam_path in the order given.
+#   single number            -> recycled to every BAM
+#   unnamed vector / list    -> positional; length must equal length(bam_path)
+#   named vector / list      -> keyed lookup; a key is a BAM's full path (as given), its basename
+#                               ("x.bam"), or its output column name ("x"). Every BAM must match
+#                               exactly one key (no default fallback); unused keys are allowed.
+#   single string            -> path to a table with columns 'bam' (key) and 'ext'; read and used
+#                               as the named lookup above (other columns ignored)
+.resolve_ext <- function(ext, bam_path) {
+  src <- ""
+  if (is.character(ext)) {
+    if (length(ext) != 1)
+      stop("A character 'ext' must be a single path to a table with columns 'bam' and 'ext'.")
+    if (!file.exists(ext))
+      stop("'ext' is a string but no such file: ", ext)
+    tab <- data.table::fread(ext)
+    if (!all(c("bam", "ext") %in% names(tab)))
+      stop("The 'ext' table must have columns 'bam' and 'ext': ", ext)
+    src <- paste0(" from ", ext)
+    ext <- setNames(tab$ext, as.character(tab$bam))
+  }
+  if (is.list(ext)) {
+    if (!all(vapply(ext, function(e) is.numeric(e) && length(e) == 1, logical(1))))
+      stop("Every element of an 'ext' list must be a single number.")
+    nms <- names(ext)
+    ext <- unlist(ext, use.names = FALSE)
+    names(ext) <- nms
+  }
+  if (!is.numeric(ext) || length(ext) == 0)
+    stop("'ext' must be a number, a vector/list of numbers, or a path to an ext table.")
+  # value check applies only to the values actually used (a lookup table may hold unused rows)
+  check_values <- function(v)
+    if (any(!is.finite(v)) || any(v != round(v)))
+      stop("'ext' values must be finite whole numbers (bp).")
+
+  n   <- length(bam_path)
+  nms <- names(ext)
+  if (is.null(nms)) {
+    check_values(ext)
+    if (length(ext) == 1) return(rep(as.integer(ext), n))
+    if (length(ext) != n)
+      stop(sprintf(paste0("Unnamed 'ext' has length %d but there are %d BAMs. Give one number, ",
+                          "one per BAM (in bam_path order), or a named vector/list."),
+                   length(ext), n))
+    return(as.integer(ext))
+  }
+  if (anyNA(nms) || any(nms == ""))
+    stop("'ext' is partially named; name every element or none.")
+
+  base <- basename(bam_path)
+  col  <- tools::file_path_sans_ext(base)
+  # hit[i, j]: key i refers to BAM j
+  hit <- matrix(vapply(seq_len(n), function(j) nms %in% c(bam_path[j], base[j], col[j]),
+                       logical(length(nms))),
+                nrow = length(nms))
+  problems <- c(
+    if (any(rowSums(hit) > 1))
+      paste0("keys matching several BAMs: ", paste(nms[rowSums(hit) > 1], collapse = ", ")),
+    if (any(colSums(hit) == 0))
+      paste0("BAMs with no 'ext' key: ", paste(bam_path[colSums(hit) == 0], collapse = ", ")),
+    if (any(colSums(hit) > 1))
+      paste0("BAMs given more than one 'ext' key: ", paste(bam_path[colSums(hit) > 1], collapse = ", "))
+  )
+  if (length(problems))
+    stop("Named 'ext' must give every BAM exactly one key:\n  ", paste(problems, collapse = "\n  "))
+  used <- ext[vapply(seq_len(n), function(j) which(hit[, j]), integer(1))]
+  check_values(used)
+  cat(sprintf("ext: used %d of %d keys%s\n", n, length(nms), src))
+  as.integer(used)
+}
+
+# ---- Peak-directory helper ('regions' = a directory) ----
+# Union every peak file (.bed / .narrowPeak / .broadPeak, optionally .gz) under 'dir' (recursive,
+# sorted, excluding anything under out_dir) with build_peak_set(min_support = 1) into
+# <out_dir>/<basename(dir)>.bed (natural chromosome order, then start) and return that path. Each BAM must have exactly one same-named
+# peak file in its own folder under 'dir' (H3K27ac.bam <-> H3K27ac.bed.gz). Identical copies of a
+# peak file (e.g. one per replicate) do not change a min_support = 1 union.
+.union_peak_dir <- function(dir, bam_path, out_dir, ref_genome) {
+  peak_re <- "\\.(bed|narrowPeak|broadPeak)(\\.gz)?$"
+  peaks <- sort(list.files(dir, pattern = peak_re, recursive = TRUE, full.names = TRUE))
+  out_abs <- normalizePath(out_dir, mustWork = FALSE)
+  peaks <- peaks[!startsWith(normalizePath(peaks), paste0(out_abs, "/"))]
+  if (length(peaks) == 0)
+    stop("No peak files (.bed/.narrowPeak/.broadPeak, optionally .gz) found under: ", dir)
+
+  # BAM <-> peak pairing: same file stem, same folder
+  peak_stem <- sub(peak_re, "", basename(peaks))
+  peak_dir  <- normalizePath(dirname(peaks))
+  problems <- character(0)
+  for (b in bam_path) {
+    hit <- which(peak_stem == tools::file_path_sans_ext(basename(b)) &
+                 peak_dir == normalizePath(dirname(b)))
+    if (length(hit) != 1)
+      problems <- c(problems, sprintf("%s: %d same-named peak file(s) next to it under %s",
+                                      b, length(hit), dir))
+  }
+  if (length(problems))
+    stop("With 'regions' = a directory, every BAM needs exactly one same-named peak file ",
+         "in its own folder:\n  ", paste(problems, collapse = "\n  "))
+
+  cat(sprintf("regions: union of %d peak files under %s (build_peak_set, min_support = 1)\n",
+              length(peaks), dir))
+  bed <- build_peak_set(peak_path = peaks, pair = basename(normalizePath(dir)),
+                        conditions = rep("all", length(peaks)), ref_genome = ref_genome,
+                        out_dir = out_dir, window_size = NULL, min_support = 1L)
+
+  # build_peak_set orders chromosomes by first appearance in the peak files (ENCODE: chr1, chr10, ...);
+  # rewrite the union in natural order (chr1, chr2, ..., chrX, chrY), then by start
+  dt <- data.table::fread(bed, header = FALSE)
+  gr <- sort(GenomeInfoDb::sortSeqlevels(
+    GRanges(seqnames = dt$V1, ranges = IRanges::IRanges(start = dt$V2 + 1L, end = dt$V3))))
+  data.table::fwrite(data.table::data.table(as.character(seqnames(gr)), start(gr) - 1L, end(gr)),
+                     bed, sep = "\t", col.names = FALSE)
+  bed
+}
+
 # Build Count Matrix Function
 # Post: Build a fragment-overlap count matrix from paired-end BAM files over user-specified genomic regions and save it as a Feather file.
 # Parameter:
 #   bam_path  : Character vector of BAM file paths. Each BAM file becomes one column in the output matrix.
 #   regions   : Either
 #               - a single integer (bin size in bp), e.g. regions = 5000, which tiles the genome into fixed-size bins; or
-#               - a single file path to a BED / TSV / TXT / CSV file containing custom genomic regions.
+#               - a single file path to a BED / TSV / TXT / CSV file containing custom genomic regions; or
+#               - a single directory: every peak file under it (.bed / .narrowPeak / .broadPeak, optionally
+#                 .gz; recursive) is unioned with build_peak_set(min_support = 1) into
+#                 <out_dir>/<dir name>.bed (rows in natural chromosome order: chr1, chr2, ..., chrX, chrY,
+#                 then by start), which is then used as the region file. Each BAM must have
+#                 exactly one same-named peak file in its own folder (H3K27ac.bam <-> H3K27ac.bed.gz).
+#                 Calls that pass the same directory get the same rows.
 #   out_dir  : Directory where the output Feather file will be written. Default "./".
 #   ref_genome: Reference genome used when regions is numeric. One of "hg38" or "mm10". Ignored when custom regions are provided.
 #   sample_name: Optional character. If provided, it is prepended to the output filename.
 #   force_chr_coord: When TRUE, region IDs ("pos" column) are always  "CHR_start_end", even if gene_id is available. When FALSE and a non-empty gene_id column exists, gene_id is used as the region identifier.
+#   seq_type  : "auto" (default), "PE" or "SE". "auto" decides from the first BAM (sorted by name), as
+#               before, and then stops if any other BAM's flags say otherwise (a mixed PE/SE batch
+#               would otherwise be miscounted). "PE"/"SE" declare the type; every BAM is checked
+#               against it and a mismatch stops with an error.
+#   ext       : SE read extension in bp (default 0 = no extension, the original behaviour). Ignored for
+#               PE. > 0 extends each read from its 5' end toward 3' to 'ext' bp. One of: a single
+#               number (every BAM); an unnamed vector / list (one per BAM, in bam_path order); a named
+#               vector / list keyed by the BAM's full path, basename or column name (every BAM must
+#               match exactly one key; unused keys are allowed); or a path to a table with columns
+#               'bam' and 'ext' used as that keyed lookup.
 # Output: Writes a Feather file whose first column is 'pos' and remaining columns are fragment-overlap counts per BAM file. Returns the full output file path (character).
 
-build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "hg38", sample_name = NULL, force_chr_coord = FALSE) {
+build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "hg38", sample_name = NULL, force_chr_coord = FALSE,
+                               seq_type = c("auto", "PE", "SE"), ext = 0L) {
   # Load Libraries
   suppressPackageStartupMessages({
     library(GenomicAlignments)
@@ -30,12 +176,21 @@ build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "
     library(rtracklayer)
   })
 
+  seq_type    <- match.arg(seq_type)
+  ext_arg     <- ext        # captured here: the region block below reuses the name 'ext'
+  bam_path_in <- bam_path   # order as given, for a positional 'ext'
+
   # Set up parallel processing
   BPPARAM <- get_BPPARAM()
   
   # Create folder
   if (!dir.exists(out_dir)) {
     dir.create(out_dir, recursive = TRUE)
+  }
+
+  # A directory of paired peak files -> their union as the region file (see .union_peak_dir)
+  if (is.character(regions) && length(regions) == 1 && dir.exists(regions)) {
+    regions <- .union_peak_dir(regions, bam_path, out_dir, ref_genome)
   }
 
   # Define Regions
@@ -72,7 +227,27 @@ build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "
   bam_style <- seqlevelsStyle(bam_seqinfo)[1]
 
   # Detect single or paired
-  is_paired <- is_bam_paired(bam_path)
+  if (seq_type == "auto") {
+    is_paired <- is_bam_paired(bam_path)
+  } else {
+    is_paired <- (seq_type == "PE")
+  }
+  # Every BAM must agree with that decision (first 1000 records each; BAMs with no records skipped)
+  detected <- vapply(bam_path, .bam_paired_head, logical(1), USE.NAMES = FALSE)
+  bad <- which(!is.na(detected) & detected != is_paired)
+  if (length(bad))
+    stop(sprintf("seq_type = '%s' treats this batch as %s, but the flags of these BAMs say %s:\n  %s\n%s",
+                 seq_type, if (is_paired) "paired-end" else "single-end",
+                 if (is_paired) "single-end" else "paired-end",
+                 paste(bam_path[bad], collapse = "\n  "),
+                 "A batch must be all PE or all SE; split it, or set seq_type to match the data."))
+
+  # Per-BAM SE extension, aligned to the sorted bam_path (sort(x) == x[order(x)])
+  ext_vec <- if (is_paired) rep(NA_integer_, length(bam_path)) else
+    .resolve_ext(ext_arg, bam_path_in)[order(bam_path_in)]
+  if (!is_paired && any(ext_vec > 0))
+    cat("SE read extension (per BAM):\n",
+        paste0("  ", tools::file_path_sans_ext(basename(bam_path)), " = ", ext_vec, "\n"), sep = "")
 
   # Generate Count Matrix for each chr
   # Process custom regions (no chromosome loop needed)
@@ -146,6 +321,10 @@ build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "
           temp <- readGAlignments(bam, param = param)
           if (length(temp) == 0) {
             bamContent <- GRanges()
+          } else if (ext_vec[k] > 0) {
+            # SE read extension: keep the 5' end, extend toward 3' to ext bp, clip at chromosome ends
+            bamContent <- trim(resize(as(temp, "GRanges"), width = ext_vec[k], fix = "start"))
+            strand(bamContent) <- "*"
           } else {
             bamContent <- GRanges(
               seqnames = seqnames(temp),
@@ -255,6 +434,10 @@ build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "
           temp <- readGAlignments(bam, param = param)
           if (length(temp) == 0) {
             bamContent <- GRanges()
+          } else if (ext_vec[k] > 0) {
+            # SE read extension: keep the 5' end, extend toward 3' to ext bp, clip at chromosome ends
+            bamContent <- trim(resize(as(temp, "GRanges"), width = ext_vec[k], fix = "start"))
+            strand(bamContent) <- "*"
           } else {
             bamContent <- GRanges(
               seqnames = seqnames(temp),
