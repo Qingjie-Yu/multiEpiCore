@@ -159,9 +159,7 @@ peak_genomic_distribution <- function(peak_path, out_dir = "./", pattern = "_pea
 # dist_to_tss: signed, strand-aware distance from the peak summit (narrowPeak
 #   column 10; peak midpoint if absent or -1) to the TSS.
 #   < 0 = upstream of the TSS, > 0 = downstream (into the gene body).
-peak_gene_annotation <- function(peak_path, out_dir = "./", pattern = "_peaks\\.narrowPeak$",
-                                 ref_genome = "hg38", gene_types = "protein_coding",
-                                 upstream = 20000, downstream = 0) {
+peak_gene_annotation <- function(peak_path, out_dir = "./", pattern = "_peaks\\.narrowPeak$", ref_genome = "hg38", gene_types = "protein_coding", upstream = 20000, downstream = 0) {
   suppressPackageStartupMessages({
     library(GenomicRanges)
   })

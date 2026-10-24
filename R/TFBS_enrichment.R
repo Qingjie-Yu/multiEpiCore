@@ -1,13 +1,27 @@
+# Build fixed-width test windows: summit-centered if mcols(gr)$peak exists
+# (narrowPeak column 10, 0-based offset from start; -1 = no summit), else region center.
+make_test_window <- function(gr, width) {
+  offset <- mcols(gr)$peak
+  if (is.null(offset)) {
+    return(resize(gr, width = width, fix = "center"))
+  }
+  has_summit <- !is.na(offset) & offset >= 0
+  center <- ifelse(has_summit,
+                   start(gr) + offset,
+                   start(gr) + (width(gr) - 1L) %/% 2L)
+  GRanges(seqnames(gr), IRanges(center - width %/% 2L, width = width),
+          strand = strand(gr), seqinfo = seqinfo(gr))
+}
+
 # Write region-level TFBS overlap records
 #
 # Output: gzipped BED-like TSV (#chrom, start, end, TF), 0-based half-open;
-# one row per region-TF pair where the region overlaps >= 1 motif site.
+# one row per region-TF pair. Overlap is judged on the test windows (same as
+# the enrichment test); coordinates written are those of the input regions.
 
-write_TFBS_region <- function(region_gr, TFBS_library, out_path) {
-  # GRangesList as query: hits are unique (TF, region) pairs,
-  # same counting rule as countOverlaps(TFBS_library, region_gr)
-  hits <- findOverlaps(TFBS_library, region_gr)
-  idx <- subjectHits(hits)
+write_TFBS_region <- function(region_gr, test_gr, TFBS_library, out_path) {
+  hits <- findOverlaps(TFBS_library, test_gr)
+  idx <- subjectHits(hits)   # test_gr is index-aligned with region_gr
 
   dt <- unique(data.table(
     chrom = as.character(seqnames(region_gr))[idx],
@@ -29,10 +43,11 @@ write_TFBS_region <- function(region_gr, TFBS_library, out_path) {
 # target regions against control regions using Fisher's exact test.
 
 TFBS_enrichment_single <- function(query_gr, control_gr, TFBS_library, regions = NULL, out_path = "./TFBS_enrichment.tsv", region_out_path = NULL, BPPARAM = BiocParallel::SerialParam()) {
+  query_input <- query_gr
   # Resize regions if specified
   if (!is.null(regions)) {
-    query_gr <- resize(query_gr, width = regions, fix = "center")
-    control_gr <- resize(control_gr, width = regions, fix = "center")
+    query_gr <- make_test_window(query_gr, regions)
+    control_gr <- make_test_window(control_gr, regions)
   }
 
   # Count overlaps between motif sites and regions
@@ -88,7 +103,7 @@ TFBS_enrichment_single <- function(query_gr, control_gr, TFBS_library, regions =
   message(glue("Found {n_significant} significant motifs at FDR < 0.05"))
 
   if (!is.null(region_out_path)) {
-    write_TFBS_region(query_gr, TFBS_library, region_out_path)
+    write_TFBS_region(query_input, query_gr, TFBS_library, region_out_path)
   }
 
   invisible(out_path)
@@ -108,8 +123,10 @@ TFBS_enrichment_single <- function(query_gr, control_gr, TFBS_library, regions =
 #          are saved to individual TSV files.
 #   control: GRanges object containing control/background genomic regions.
 #            Same control set is used for all elements if query is GRangesList.
-#   regions: Width in base pairs to resize all regions around their center.
-#            If NULL, uses original region sizes. Default: NULL
+#   regions: Width (bp) of fixed test windows. Windows are centered on the summit
+#            if mcols(query)$peak exists (narrowPeak column 10, offset from start),
+#            otherwise on the region center. If NULL, original regions are tested.
+#            Default: NULL
 #   ref_genome: Reference genome version ("hg38" or "mm10"). Default: "hg38"
 #   functional_region: Optional GRanges object of functional regions (e.g., ATAC-seq
 #                      peaks, DNase hypersensitive sites). If provided, only motif
@@ -123,8 +140,8 @@ TFBS_enrichment_single <- function(query_gr, control_gr, TFBS_library, regions =
 #                     "<out_dir>/TFBS_region/" as "TFBS_region_<label>.tsv.gz"
 #                     (or "TFBS_region.tsv.gz" for GRanges input): BED-like
 #                     columns #chrom, start, end, TF (0-based half-open), one row
-#                     per region-TF pair. Coordinates are those of the tested
-#                     regions (after resizing by `regions`, if set). Default: FALSE
+#                     per region-TF pair. Coordinates are those of the input
+#                     regions; overlap is judged on the test windows. Default: FALSE
 #
 # Returns:
 #   Character vector of output file path(s), returned invisibly:
