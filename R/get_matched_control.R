@@ -335,7 +335,7 @@ get_matched_control <- function(query, ref_genome = "hg38", ref_source = "knownG
   } else {
     # Process each element of GRangesList separately
     control_grl <- lapply(names(query), function(label) {
-      cat("\nProcessing cluster:", label, "with", length(query[[label]]), "regions\n")
+      cat("\nProcessing target:", label, "with", length(query[[label]]), "regions\n")
       control_regions_single(
         query_gr = query[[label]],
         genes_gr = genes_gr,
