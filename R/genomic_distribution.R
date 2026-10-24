@@ -278,9 +278,9 @@ repeat_distribution <- function(query, out_dir = "./", ref_genome = "hg38", mode
 
   # Load reference library
   if (ref_genome == "hg38") {
-    repeat_library_file <- download_rds("RepeatMasker_hg38_processed.rds")
+    repeat_library_file <- download_rds("RepeatMasker_hg38.rds")
   } else if (ref_genome == "mm10") {
-    repeat_library_file <- download_rds("RepeatMasker_mm10_processed.rds")
+    repeat_library_file <- download_rds("RepeatMasker_mm10.rds")
   } else {
     stop("ref_genome must be 'hg38' or 'mm10'")
   }
@@ -310,7 +310,7 @@ chromhmm_distribution <- function(query, out_dir = "./", ref_genome = "hg38", mo
   hmm_order <- c(
     "Acet", "EnhWk", "EnhA", "PromF", "TSS", # active enhancers & promoters
     "TxWk", "TxEx", "Tx", # transcription continuum
-    "OpenC", "TxEnh", # accessible chromatin & enhancer-coupled transcription
+    "DNase", "OpenC", "TxEnh", # accessible chromatin & enhancer-coupled transcription
     "ReprPCopenC",
     "BivProm", "ZNF", # developmental regulation & ZNF clusters
     "ReprPC", "HET", # Polycomb repression & constitutive heterochromatin
@@ -322,7 +322,7 @@ chromhmm_distribution <- function(query, out_dir = "./", ref_genome = "hg38", mo
     c(
       "#EF4444", "#FB9A99", "#FF7F00", "#FDBF6F", "#CAB2D6", # active
       "#B2DF8A", "#22C55E", "#10B981", # transcription
-      "#A6CEE3", "#6A3D9A", # accessible
+      "#CFE8F3", "#A6CEE3", "#6A3D9A", # accessible
       "#FFFF99", # intermediate
       "#B15928", "#FCCDE5", # developmental
       "#3B82F6", "#1E40AF", # repressed
@@ -379,9 +379,9 @@ ccre_distribution <- function(query, out_dir = "./", ref_genome = "hg38", mode =
   )
 
   if (ref_genome == "hg38") {
-    ccre_library_file <- download_rds("ENCODE_cCRE_v4_hg38.rds")
+    ccre_library_file <- download_rds("ENCODE_cCRE_hg38.rds")
   } else if (ref_genome == "mm10") {
-    ccre_library_file <- download_rds("ENCODE_cCRE_v4_mm10.rds")
+    ccre_library_file <- download_rds("ENCODE_cCRE_mm10.rds")
   } else {
     stop("ref_genome must be 'hg38' or 'mm10'")
   }
@@ -421,17 +421,17 @@ genic_distribution <- function(query, out_dir = "./", ref_genome = "hg38", ref_s
 
   if (ref_genome == "hg38") {
     if (ref_source == "knownGene") {
-      gene_library_file <- download_rds("knownGene_hg38_processed.rds")
+      gene_library_file <- download_rds("knownGene_genic_hg38.rds")
     } else if (ref_source == "GENCODE") {
-      gene_library_file <- download_rds("GENCODE_v49_hg38_processed.rds")
+      gene_library_file <- download_rds("GENCODE_genic_hg38.rds")
     } else {
       stop("ref_source must be 'knownGene' or 'GENCODE'")
     }
   } else if (ref_genome == "mm10") {
     if (ref_source == "knownGene") {
-      gene_library_file <- download_rds("knownGene_mm10_processed.rds")
+      gene_library_file <- download_rds("knownGene_genic_mm10.rds")
     } else if (ref_source == "GENCODE") {
-      gene_library_file <- download_rds("GENCODE_vM23_mm10_processed.rds")
+      gene_library_file <- download_rds("GENCODE_genic_mm10.rds")
     } else {
       stop("ref_source must be 'knownGene' or 'GENCODE'")
     }

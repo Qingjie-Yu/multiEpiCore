@@ -252,8 +252,10 @@ control_regions_single <- function(query_gr, genes_gr, chr_sizes, n_rep = 1, reg
 #          combined into a single GRanges object.
 #   ref_genome: Reference genome version ("hg38" or "mm10")
 #   ref_source: Gene annotation source ("knownGene" or "GENCODE")
-#               - "knownGene": UCSC knownGene annotation from TxDb packages
-#               - "GENCODE": GENCODE annotations (v49 for hg38, vM23 for mm10)
+#               - "knownGene": UCSC knownGene annotation from TxDb packages;
+#                 gene span = union of all transcripts
+#               - "GENCODE": GENCODE basic annotation (v49 for hg38, vM25 for mm10);
+#                 gene span = TSS–TES of one representative transcript per gene
 #   style: Chromosome naming style (e.g., "UCSC" or "NCBI"). If NULL, inferred
 #          from query object. Default: NULL
 #   n_rep: Number of control regions to generate per target peak. Default: 1
@@ -270,9 +272,19 @@ get_matched_control <- function(query, ref_genome = "hg38", ref_source = "knownG
   # Set up parallel processing
   BPPARAM <- get_BPPARAM(verbose = FALSE, backend = "multicore")
 
-  # Validate input type
+  # Validate input
   if (!inherits(query, "GRanges") && !inherits(query, "GRangesList")) {
     stop("query must be a GRanges or GRangesList object")
+  }
+  txdb_pkgs <- c(
+    hg38 = "TxDb.Hsapiens.UCSC.hg38.knownGene",
+    mm10 = "TxDb.Mmusculus.UCSC.mm10.knownGene"
+  )
+  if (!ref_genome %in% names(txdb_pkgs)) {
+    stop("Unsupported genome. Please use 'hg38' or 'mm10'.")
+  }
+  if (!ref_source %in% c("knownGene", "GENCODE")) {
+    stop("ref_source must be 'knownGene' or 'GENCODE'")
   }
 
   # Infer chromosome style from query if not provided
@@ -280,50 +292,27 @@ get_matched_control <- function(query, ref_genome = "hg38", ref_source = "knownG
     style <- seqlevelsStyle(query)[1]
   }
 
-  # Configure genome-specific resources
-  genome_config <- list(
-    hg38 = list(
-      bsgenome = "BSgenome.Hsapiens.UCSC.hg38",
-      txdb = "TxDb.Hsapiens.UCSC.hg38.knownGene",
-      gencode_file = download_rds("GENCODE_v49_hg38_single_tx_by_evidence.rds")
-    ),
-    mm10 = list(
-      bsgenome = "BSgenome.Mmusculus.UCSC.mm10",
-      txdb = "TxDb.Mmusculus.UCSC.mm10.knownGene",
-      gencode_file = download_rds("GENCODE_vM23_mm10_single_tx_by_evidence.rds")
-    )
-  )
-
-  if (!ref_genome %in% names(genome_config)) {
-    stop("Unsupported genome. Please use 'hg38' or 'mm10'.")
-  }
-  config <- genome_config[[ref_genome]]
-
-  # Load genome sequence
-  suppressPackageStartupMessages({
-    library(config$bsgenome, character.only = TRUE, quietly = TRUE)
-  })
-  bs <- get(config$bsgenome, envir = asNamespace(config$bsgenome))
+  # Chromosome sizes from TxDb (standard chromosomes, no chrM)
+  txdb <- getExportedValue(txdb_pkgs[[ref_genome]], txdb_pkgs[[ref_genome]])
+  si <- seqinfo(txdb)
+  si <- si[grep("^chr([0-9]+|X|Y)$", seqnames(si), value = TRUE)]
+  seqlevelsStyle(si) <- style
+  chr_list <- seqnames(si)
+  chr_sizes <- seqlengths(si)
 
   # Load gene annotations
   if (ref_source == "knownGene") {
-    suppressPackageStartupMessages({
-      library(config$txdb, character.only = TRUE, quietly = TRUE)
-    })
-    txdb <- get(config$txdb, envir = asNamespace(config$txdb))
-    genes_gr <- suppressMessages(genes(txdb))
+    genes_gr <- suppressMessages(GenomicFeatures::genes(txdb))
   } else {
-    genes_gr <- readRDS(config$gencode_file)
-    genes_gr <- genes_gr[genes_gr$type == "gene"]
+    gencode_file <- download_rds(sprintf("GENCODE_rep_%s.rds", ref_genome))
+    genes_gr <- readRDS(gencode_file)
+    # One representative transcript per gene: start/end = TSS/TES
+    genes_gr <- genes_gr[genes_gr$type == "transcript"]
+    # Keep only genes whose representative transcript has supporting evidence
+    genes_gr <- genes_gr[genes_gr$rep_rank <= 7]
     names(genes_gr) <- genes_gr$gene_name
     mcols(genes_gr) <- NULL
   }
-
-  # Prepare chromosome information
-  seqlevelsStyle(bs) <- style
-  chr_list <- GenomeInfoDb::standardChromosomes(bs)
-  chr_list <- chr_list[!tolower(chr_list) %in% c("mt", "chrm", "m", "mito")]
-  chr_sizes <- seqlengths(bs)[chr_list]
 
   # Filter and sort gene annotations
   seqlevelsStyle(genes_gr) <- style
@@ -347,7 +336,7 @@ get_matched_control <- function(query, ref_genome = "hg38", ref_source = "knownG
     # Process each element of GRangesList separately
     control_grl <- lapply(names(query), function(label) {
       cat("\nProcessing cluster:", label, "with", length(query[[label]]), "regions\n")
-      control_gr <- control_regions_single(
+      control_regions_single(
         query_gr = query[[label]],
         genes_gr = genes_gr,
         chr_sizes = chr_sizes,
@@ -357,11 +346,10 @@ get_matched_control <- function(query, ref_genome = "hg38", ref_source = "knownG
         length_tolerance = length_tolerance,
         BPPARAM = BPPARAM
       )
-      control_gr
     })
     names(control_grl) <- names(query)
     control_gr <- unlist(GRangesList(control_grl), use.names = FALSE)
   }
 
-  return(control_gr)
+  control_gr
 }
