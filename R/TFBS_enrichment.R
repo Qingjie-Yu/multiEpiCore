@@ -1,9 +1,34 @@
+# Write region-level TFBS overlap records
+#
+# Output: gzipped BED-like TSV (#chrom, start, end, TF), 0-based half-open;
+# one row per region-TF pair where the region overlaps >= 1 motif site.
+
+write_TFBS_region <- function(region_gr, TFBS_library, out_path) {
+  # GRangesList as query: hits are unique (TF, region) pairs,
+  # same counting rule as countOverlaps(TFBS_library, region_gr)
+  hits <- findOverlaps(TFBS_library, region_gr)
+  idx <- subjectHits(hits)
+
+  dt <- unique(data.table(
+    chrom = as.character(seqnames(region_gr))[idx],
+    start = start(region_gr)[idx] - 1L,
+    end   = end(region_gr)[idx],
+    TF    = names(TFBS_library)[queryHits(hits)]
+  ))
+  setorder(dt, chrom, start, end, TF)
+  setnames(dt, "chrom", "#chrom")
+  fwrite(dt, out_path, sep = "\t")
+
+  message(glue("Region-level TFBS records ({nrow(dt)} region-TF pairs) saved to {out_path}"))
+  invisible(out_path)
+}
+
 # TFBS Enrichment Analysis for Single Region Set
 #
 # Internal function that performs TFBS enrichment analysis for a single set of
 # target regions against control regions using Fisher's exact test.
 
-TFBS_enrichment_single <- function(query_gr, control_gr, TFBS_library, regions = NULL, out_path = "./TFBS_enrichment.tsv", BPPARAM = BiocParallel::SerialParam()) {
+TFBS_enrichment_single <- function(query_gr, control_gr, TFBS_library, regions = NULL, out_path = "./TFBS_enrichment.tsv", region_out_path = NULL, BPPARAM = BiocParallel::SerialParam()) {
   # Resize regions if specified
   if (!is.null(regions)) {
     query_gr <- resize(query_gr, width = regions, fix = "center")
@@ -62,6 +87,10 @@ TFBS_enrichment_single <- function(query_gr, control_gr, TFBS_library, regions =
   message(glue("Results saved to {out_path}"))
   message(glue("Found {n_significant} significant motifs at FDR < 0.05"))
 
+  if (!is.null(region_out_path)) {
+    write_TFBS_region(query_gr, TFBS_library, region_out_path)
+  }
+
   invisible(out_path)
 }
 
@@ -90,6 +119,12 @@ TFBS_enrichment_single <- function(query_gr, control_gr, TFBS_library, regions =
 #            it doesn't exist. Default: "./"
 #   style: Chromosome naming style (e.g., "UCSC" or "NCBI"). If NULL, inferred
 #          from query object. Default: NULL
+#   save_region_TFBS: If TRUE, also write region-level TF overlap records to
+#                     "<out_dir>/TFBS_region/" as "TFBS_region_<label>.tsv.gz"
+#                     (or "TFBS_region.tsv.gz" for GRanges input): BED-like
+#                     columns #chrom, start, end, TF (0-based half-open), one row
+#                     per region-TF pair. Coordinates are those of the tested
+#                     regions (after resizing by `regions`, if set). Default: FALSE
 #
 # Returns:
 #   Character vector of output file path(s), returned invisibly:
@@ -97,7 +132,7 @@ TFBS_enrichment_single <- function(query_gr, control_gr, TFBS_library, regions =
 #   - For GRangesList input: Vector of paths to "TFBS_enrichment_<label>.tsv" files
 #   Each TSV file contains motif enrichment statistics (odds ratio, p-value, FDR)
 
-TFBS_enrichment <- function(query, control, regions = NULL, ref_genome = "hg38", functional_region = NULL, out_dir = "./", style = NULL) {
+TFBS_enrichment <- function(query, control, regions = NULL, ref_genome = "hg38", functional_region = NULL, out_dir = "./", style = NULL, save_region_TFBS = FALSE) {
   # Load required packages
   suppressPackageStartupMessages({
     library(IRanges)
@@ -122,6 +157,10 @@ TFBS_enrichment <- function(query, control, regions = NULL, ref_genome = "hg38",
 
   if (!dir.exists(out_dir)) {
     dir.create(out_dir, recursive = TRUE)
+  }
+  region_dir <- file.path(out_dir, "TFBS_region")
+  if (save_region_TFBS && !dir.exists(region_dir)) {
+    dir.create(region_dir, recursive = TRUE)
   }
 
   # Load TFBS library
@@ -171,6 +210,7 @@ TFBS_enrichment <- function(query, control, regions = NULL, ref_genome = "hg38",
       TFBS_library = TFBS_library,
       regions = regions,
       out_path = out_path,
+      region_out_path = if (save_region_TFBS) file.path(region_dir, "TFBS_region.tsv.gz") else NULL,
       BPPARAM = BPPARAM
     )
 
@@ -190,6 +230,7 @@ TFBS_enrichment <- function(query, control, regions = NULL, ref_genome = "hg38",
         TFBS_library = TFBS_library,
         regions = regions,
         out_path = out_path,
+        region_out_path = if (save_region_TFBS) file.path(region_dir, paste0("TFBS_region_", label, ".tsv.gz")) else NULL,
         BPPARAM = BPPARAM
       )
     })

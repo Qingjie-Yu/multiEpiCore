@@ -267,7 +267,7 @@ read_summit_to_grl <- function(peak_path, pattern = "_peaks\\.narrowPeak$", widt
 }
 
 # TFBS enrichment pipeline
-peak_TFBS_enrichment <- function(peak_path, out_dir = "./", ref_genome = "hg38", ref_source = "knownGene", pattern = "_peaks\\.narrowPeak$", control_rep = 1, regions = 800, plot = TRUE, plot_n_top = 20, seed = 42) {
+peak_TFBS_enrichment <- function(peak_path, out_dir = "./", ref_genome = "hg38", ref_source = "knownGene", pattern = "_peaks\\.narrowPeak$", control_rep = 1, regions = 800, plot = TRUE, plot_n_top = 20, seed = 42, save_region_TFBS = TRUE) {
   # Load packages
   suppressPackageStartupMessages({
     library(data.table)
@@ -315,7 +315,7 @@ peak_TFBS_enrichment <- function(peak_path, out_dir = "./", ref_genome = "hg38",
   cat("\n", strrep("=", 40), "\n", sep = "")
   cat("  TFBS Enrichment Analysis")
   cat("\n", strrep("=", 40), "\n", sep = "")
-  tsv_paths <- TFBS_enrichment(query = grl, control = control_gr, out_dir = out_dir, ref_genome = ref_genome)
+  tsv_paths <- TFBS_enrichment(query = grl, control = control_gr, out_dir = out_dir, ref_genome = ref_genome, save_region_TFBS = save_region_TFBS)
 
   if (plot) {
     cat("\n", strrep("=", 40), "\n", sep = "")
