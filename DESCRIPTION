@@ -25,6 +25,7 @@ Imports:
     caret,
     circlize,
     clue,
+    cluster,
     ComplexHeatmap,
     cowplot,
     curl,
