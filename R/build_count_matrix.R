@@ -89,13 +89,54 @@ is_bam_paired <- function(bam_path) {
   as.integer(used)
 }
 
+# ---- hg38 blacklist helpers ('blacklist' = TRUE) ----
+# The ENCODE hg38 blacklist v2 (Boyle Lab; Amemiya et al. 2019) ships with the package as
+# inst/extdata/hg38-blacklist.v2.bed.gz.
+.hg38_blacklist_file <- function() {
+  system.file("extdata", "hg38-blacklist.v2.bed.gz", package = "multiEpiCore", mustWork = TRUE)
+}
+
+.read_hg38_blacklist <- function() {
+  dt <- data.table::fread(.hg38_blacklist_file(), header = FALSE, select = 1:3)
+  GRanges(seqnames = dt$V1, ranges = IRanges::IRanges(start = dt$V2 + 1L, end = dt$V3))
+}
+
+# 'bl' renamed to a seqlevels style ("UCSC" chr1, "NCBI" 1, ...) unless it already has it
+.bl_in_style <- function(bl, style) {
+  if (!is.na(style) && !style %in% seqlevelsStyle(bl)) seqlevelsStyle(bl) <- style
+  bl
+}
+
+# TRUE for each range of 'gr' that does not overlap 'bl' by >= 1 bp. Whole ranges are kept or dropped,
+# never trimmed (as bedtools intersect -v). 'bl' is first renamed to the naming style of 'gr' (chr1 <-> 1).
+.not_blacklisted <- function(gr, bl) {
+  style <- tryCatch(seqlevelsStyle(gr)[1], error = function(e) NA_character_)
+  !overlapsAny(gr, .bl_in_style(bl, style), ignore.strand = TRUE)
+}
+
+# The hg38 blacklist is for hg38 data only: every BAM's chromosome lengths must be hg38 (names in the
+# chr1 or the 1 style). Names alone cannot tell: mm10 chromosomes are also called chr1, chr2, ...
+.check_bams_hg38 <- function(bam_path) {
+  hg38 <- BSgenome.Hsapiens.UCSC.hg38::BSgenome.Hsapiens.UCSC.hg38
+  len_hg <- seqlengths(hg38)[GenomeInfoDb::standardChromosomes(hg38)]
+  len_hg <- c(len_hg, setNames(len_hg, sub("^chr", "", names(len_hg))))
+  for (b in bam_path) {
+    len <- scanBamHeader(b)[[1]]$targets
+    common <- intersect(names(len), names(len_hg))
+    if (length(common) == 0 || any(len[common] != len_hg[common]))
+      stop("blacklist = TRUE uses the hg38 blacklist, but the chromosome lengths of this BAM are not hg38: ", b)
+  }
+}
+
 # ---- Peak-directory helper ('regions' = a directory) ----
 # Union every peak file (.bed / .narrowPeak / .broadPeak, optionally .gz) under 'dir' (recursive,
 # sorted, excluding anything under out_dir) with build_peak_set(min_support = 1) into
 # <out_dir>/<basename(dir)>.bed (natural chromosome order, then start) and return that path. Each BAM must have exactly one same-named
 # peak file in its own folder under 'dir' (H3K27ac.bam <-> H3K27ac.bed.gz). Identical copies of a
 # peak file (e.g. one per replicate) do not change a min_support = 1 union.
-.union_peak_dir <- function(dir, bam_path, out_dir, ref_genome) {
+# With a blacklist (GRanges), blacklisted peaks are dropped file by file BEFORE the union, as the
+# bl_filtered peak sets are made; a peak overlapping it would otherwise take its merged neighbours along.
+.union_peak_dir <- function(dir, bam_path, out_dir, ref_genome, blacklist = NULL) {
   peak_re <- "\\.(bed|narrowPeak|broadPeak)(\\.gz)?$"
   peaks <- sort(list.files(dir, pattern = peak_re, recursive = TRUE, full.names = TRUE))
   out_abs <- normalizePath(out_dir, mustWork = FALSE)
@@ -120,8 +161,36 @@ is_bam_paired <- function(bam_path) {
 
   cat(sprintf("regions: union of %d peak files under %s (build_peak_set, min_support = 1)\n",
               length(peaks), dir))
-  bed <- build_peak_set(peak_path = peaks, pair = basename(normalizePath(dir)),
-                        conditions = rep("all", length(peaks)), ref_genome = ref_genome,
+
+  # Blacklist: build_peak_set reads filtered 3-column copies (it uses only the first 3 columns).
+  # A file with no peak left is skipped (read_peak_file stops on an empty file).
+  union_input <- peaks
+  if (!is.null(blacklist)) {
+    td <- tempfile("blacklist_peaks_")
+    dir.create(td)
+    on.exit(unlink(td, recursive = TRUE), add = TRUE)
+    union_input <- character(0)
+    n_in <- n_kept <- 0
+    for (i in seq_along(peaks)) {
+      gr <- read_peak_file(peaks[i])
+      keep <- .not_blacklisted(gr, blacklist)
+      n_in <- n_in + length(gr)
+      n_kept <- n_kept + sum(keep)
+      if (any(keep)) {
+        f <- file.path(td, sprintf("%04d.bed", i))
+        data.table::fwrite(data.table::data.table(as.character(seqnames(gr))[keep], start(gr)[keep] - 1L,
+                                                  end(gr)[keep]), f, sep = "\t", col.names = FALSE)
+        union_input <- c(union_input, f)
+      }
+    }
+    cat(sprintf("blacklist: removed %d of %d peaks (hg38-blacklist.v2, overlap >= 1 bp)\n",
+                n_in - n_kept, n_in))
+    if (length(union_input) == 0)
+      stop("Every peak under ", dir, " overlaps the blacklist.")
+  }
+
+  bed <- build_peak_set(peak_path = union_input, pair = basename(normalizePath(dir)),
+                        conditions = rep("all", length(union_input)), ref_genome = ref_genome,
                         out_dir = out_dir, window_size = NULL, min_support = 1L)
 
   # build_peak_set orders chromosomes by first appearance in the peak files (ENCODE: chr1, chr10, ...);
@@ -161,10 +230,14 @@ is_bam_paired <- function(bam_path) {
 #               vector / list keyed by the BAM's full path, basename or column name (every BAM must
 #               match exactly one key; unused keys are allowed); or a path to a table with columns
 #               'bam' and 'ext' used as that keyed lookup.
+#   blacklist : FALSE (default) or TRUE. TRUE drops every region (or bin) that overlaps the ENCODE hg38
+#               blacklist v2 by >= 1 bp; whole regions are dropped, never trimmed. With 'regions' = a
+#               directory the peaks are filtered file by file before the union. hg38 only: needs
+#               ref_genome = "hg38" and BAMs whose chromosome lengths are hg38. File names do not change.
 # Output: Writes a Feather file whose first column is 'pos' and remaining columns are fragment-overlap counts per BAM file. Returns the full output file path (character).
 
 build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "hg38", sample_name = NULL, force_chr_coord = FALSE,
-                               seq_type = c("auto", "PE", "SE"), ext = 0L) {
+                               seq_type = c("auto", "PE", "SE"), ext = 0L, blacklist = FALSE) {
   # Load Libraries
   suppressPackageStartupMessages({
     library(GenomicAlignments)
@@ -179,6 +252,8 @@ build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "
   seq_type    <- match.arg(seq_type)
   ext_arg     <- ext        # captured here: the region block below reuses the name 'ext'
   bam_path_in <- bam_path   # order as given, for a positional 'ext'
+  if (!is.logical(blacklist) || length(blacklist) != 1 || is.na(blacklist))
+    stop("'blacklist' must be TRUE or FALSE.")
 
   # Set up parallel processing
   BPPARAM <- get_BPPARAM()
@@ -188,9 +263,20 @@ build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "
     dir.create(out_dir, recursive = TRUE)
   }
 
+  # Optional hg38 blacklist, checked before any work is done
+  bl <- NULL
+  if (blacklist) {
+    if (ref_genome != "hg38")
+      stop("blacklist = TRUE is only available for hg38 (ref_genome = \"hg38\").")
+    .check_bams_hg38(bam_path)
+    bl <- .read_hg38_blacklist()
+  }
+  bl_regions <- bl  # applied to regions / bins below; NULL in directory mode, where the peaks are filtered
+
   # A directory of paired peak files -> their union as the region file (see .union_peak_dir)
   if (is.character(regions) && length(regions) == 1 && dir.exists(regions)) {
-    regions <- .union_peak_dir(regions, bam_path, out_dir, ref_genome)
+    regions <- .union_peak_dir(regions, bam_path, out_dir, ref_genome, blacklist = bl)
+    bl_regions <- NULL
   }
 
   # Define Regions
@@ -281,6 +367,18 @@ build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "
       if (!is.null(mcols(bin)) && "gene_id" %in% colnames(mcols(bin))) {
         binChriDataframe$gene_id <- mcols(bin)$gene_id
       }
+    }
+
+    # Blacklist: drop whole regions that overlap it (the other rows keep their order)
+    if (!is.null(bl_regions)) {
+      keep <- .not_blacklisted(bin, bl_regions)
+      cat(sprintf("blacklist: removed %d of %d regions (hg38-blacklist.v2, overlap >= 1 bp)\n",
+                  sum(!keep), length(keep)))
+      if (!any(keep))
+        stop("Every region overlaps the blacklist.")
+      bin <- bin[keep]
+      binChriDataframe <- binChriDataframe[keep, , drop = FALSE]
+      rownames(binChriDataframe) <- NULL
     }
 
     # Process BAM files for custom regions (parallelized by chromosome)
@@ -399,10 +497,17 @@ build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "
     chr_list <- chr_list[!tolower(chr_list) %in% c("mt", "chrm", "m", "mito")]
     chrSizes <- seqlengths(ref_seqinfo)[chr_list]
 
+    # Blacklist in the BAM's naming style, ready for the workers (NULL = no blacklist)
+    bl_bins <- if (!is.null(bl_regions)) .bl_in_style(bl_regions, bam_style)
+
     # Process fixed bins with parallel chromosome processing
     binChriDataframe_list <- bplapply(chr_list, function(chr_i) {
       chrSizei <- chrSizes[chr_i]
       bin <- tileGenome(chrSizei, tilewidth = BINSIZE, cut.last.tile.in.chrom = TRUE)
+      if (!is.null(bl_bins)) {
+        bin <- bin[!overlapsAny(bin, bl_bins, ignore.strand = TRUE)]
+        if (length(bin) == 0) return(NULL)  # every bin of this chromosome is blacklisted
+      }
       binChriDataframe <- as.data.frame(bin)[, c("start", "end")]
       chr_df <- data.frame(CHR = names(chrSizei), stringsAsFactors = FALSE)
       binChriDataframe <- cbind(chr_df, binChriDataframe)
@@ -484,6 +589,11 @@ build_count_matrix <- function(bam_path, regions, out_dir = "./", ref_genome = "
     }, BPPARAM = BPPARAM)
 
     binChriDataframe_full <- as.data.frame(data.table::rbindlist(binChriDataframe_list))
+    if (!is.null(bl_regions)) {
+      n_bins <- sum(ceiling(chrSizes / BINSIZE))
+      cat(sprintf("blacklist: removed %d of %d bins (hg38-blacklist.v2, overlap >= 1 bp)\n",
+                  n_bins - nrow(binChriDataframe_full), n_bins))
+    }
   }
 
   if (is.numeric(regions)) {
